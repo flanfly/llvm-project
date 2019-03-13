@@ -795,10 +795,7 @@ void DisassemblerTables::emitContextDecision(raw_ostream &o1, raw_ostream &o2,
                                              unsigned &ModRMTableNum,
                                              ContextDecision &decision,
                                              const char* name) const {
-  o2.indent(i2) << "static const struct ContextDecision " << name << " = {\n";
-  i2++;
-  o2.indent(i2) << "{ /* opcodeDecisions */" << "\n";
-  i2++;
+  o2.indent(i2) << "pub const " << name << ": [ContextDecision; " << IC_max << "] = [\n";
 
   for (unsigned index = 0; index < IC_max; ++index) {
     o2.indent(i2) << "/* ";
@@ -823,8 +820,8 @@ void DisassemblerTables::emitInstructionInfo(raw_ostream &o,
                                              unsigned &i) const {
   unsigned NumInstructions = InstructionSpecifiers.size();
 
-  o << "static const struct OperandSpecifier x86OperandSets[]["
-    << X86_MAX_OPERANDS << "] = {\n";
+  o << "pub const OPERAND_SETS: [[OperandSpecifier; "
+    << X86_MAX_OPERANDS << "]; " << "926" /*NumInstructions*/ << "] = [\n";
 
   typedef SmallVector<std::pair<OperandEncoding, OperandType>,
                       X86_MAX_OPERANDS> OperandListTy;
@@ -847,24 +844,27 @@ void DisassemblerTables::emitInstructionInfo(raw_ostream &o,
 
     N = ++OperandSetNum;
 
-    o << "  { /* " << (OperandSetNum - 1) << " */\n";
+    o << "   [\n";
     for (unsigned i = 0, e = OperandList.size(); i != e; ++i) {
       const char *Encoding = stringForOperandEncoding(OperandList[i].first);
       const char *Type     = stringForOperandType(OperandList[i].second);
-      o << "    { " << Encoding << ", " << Type << " },\n";
+      o << "  OperandSpecifier{ encoding: OperandEncoding::"
+        << Encoding + 9
+        << ", typ: OperandType::"
+        << Type + 5 << " },\n";
     }
-    o << "  },\n";
+    o << "  ],\n";
   }
-  o << "};" << "\n\n";
+  o << "];" << "\n\n";
 
-  o.indent(i * 2) << "static const struct InstructionSpecifier ";
-  o << INSTRUCTIONS_STR "[" << InstructionSpecifiers.size() << "] = {\n";
+  o << "pub const INSTRUCTION_SPECIFIER: [usize; "
+    << InstructionSpecifiers.size() << "] = [\n";
 
   i++;
 
   for (unsigned index = 0; index < NumInstructions; ++index) {
-    o.indent(i * 2) << "{ /* " << index << " */\n";
     i++;
+    o.indent(i * 2) << "/* " << InstructionSpecifiers[index].name << " */\n";
 
     OperandListTy OperandList;
     for (unsigned OperandIndex = 0; OperandIndex < X86_MAX_OPERANDS;
@@ -877,24 +877,21 @@ void DisassemblerTables::emitInstructionInfo(raw_ostream &o,
     }
     o.indent(i * 2) << (OperandSets[OperandList] - 1) << ",\n";
 
-    o.indent(i * 2) << "/* " << InstructionSpecifiers[index].name << " */\n";
-
     i--;
-    o.indent(i * 2) << "},\n";
   }
 
   i--;
-  o.indent(i * 2) << "};" << "\n";
+  o.indent(i * 2) << "];" << "\n\n";
 }
 
 void DisassemblerTables::emitContextTable(raw_ostream &o, unsigned &i) const {
   const unsigned int tableSize = 16384;
-  o.indent(i * 2) << "static const uint8_t " CONTEXTS_STR
-                     "[" << tableSize << "] = {\n";
+  o.indent(i * 2) << "pub const INSTRUCTION_CONTEXTS: [InstructionContext; " << tableSize << "] = [\n";
   i++;
 
   for (unsigned index = 0; index < tableSize; ++index) {
     o.indent(i * 2);
+    o << "InstructionContext::";
 
     if (index & ATTR_EVEX) {
       o << "IC_EVEX";
@@ -1014,7 +1011,7 @@ void DisassemblerTables::emitContextTable(raw_ostream &o, unsigned &i) const {
   }
 
   i--;
-  o.indent(i * 2) << "};" << "\n";
+  o.indent(i * 2) << "];" << "\n";
 }
 
 void DisassemblerTables::emitContextDecisions(raw_ostream &o1, raw_ostream &o2,
@@ -1040,6 +1037,8 @@ void DisassemblerTables::emit(raw_ostream &o) const {
   raw_string_ostream o1(s1);
   raw_string_ostream o2(s2);
 
+  o << "use crate::common::{OperandType, OperandEncoding, OperandSpecifier, InstructionContext};\n\n";
+
   emitInstructionInfo(o, i2);
   o << "\n";
 
@@ -1056,13 +1055,8 @@ void DisassemblerTables::emit(raw_ostream &o) const {
   o1 << "/* EmptyTable */\n";
   o1.indent(i1 * 2) << "0x0,\n";
   i1--;
-  emitContextDecisions(o1, o2, i1, i2, ModRMTableNum);
+  emitContextDecisions(o, o, i1, i2, ModRMTableNum);
 
-  o << o1.str();
-  o << "  0x0\n";
-  o << "};\n";
-  o << "\n";
-  o << o2.str();
   o << "\n";
   o << "\n";
 }

@@ -53,6 +53,7 @@ enum ActionType {
   GenX86FoldTables,
   GenRegisterBank,
   GenExegesis,
+  GenPanopticonInstrs,
 };
 
 namespace llvm {
@@ -124,6 +125,8 @@ namespace {
                                "Generate X86 fold tables"),
                     clEnumValN(GenRegisterBank, "gen-register-bank",
                                "Generate registers bank descriptions"),
+                    clEnumValN(GenPanopticonInstrs, "gen-panopticon-instrs",
+                               "Generate panopticon instruction descriptions"),
                     clEnumValN(GenExegesis, "gen-exegesis",
                                "Generate llvm-exegesis tables")));
 
@@ -246,6 +249,9 @@ bool LLVMTableGenMain(raw_ostream &OS, RecordKeeper &Records) {
     break;
   case GenExegesis:
     EmitExegesis(Records, OS);
+    break;
+  case GenPanopticonInstrs:
+    EmitPanopticonInstrs(Records, OS);
     break;
   }
 
