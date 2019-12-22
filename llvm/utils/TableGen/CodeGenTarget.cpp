@@ -184,11 +184,7 @@ StringRef llvm::getEnumName(MVT::SimpleValueType T) {
 /// namespace qualifier if the record contains one.
 ///
 std::string llvm::getQualifiedName(const Record *R) {
-  std::string Namespace;
-  if (R->getValue("Namespace"))
-     Namespace = R->getValueAsString("Namespace");
-  if (Namespace.empty()) return R->getName();
-  return Namespace + "::" + R->getName().str();
+  return R->getName().str();
 }
 
 

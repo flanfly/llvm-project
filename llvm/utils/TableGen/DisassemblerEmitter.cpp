@@ -113,8 +113,15 @@ void EmitDisassembler(RecordKeeper &Records, raw_ostream &OS) {
     ArrayRef<const CodeGenInstruction*> numberedInstructions =
       Target.getInstructionsByEnumValue();
 
-    for (unsigned i = 0, e = numberedInstructions.size(); i != e; ++i)
+    OS << "pub const INSTRUCTION_NAMES: &'static [&'static str] = &[\n";
+    for (unsigned i = 0, e = numberedInstructions.size(); i != e; ++i) {
+      auto instr = numberedInstructions[i];
+
       RecognizableInstr::processInstr(Tables, *numberedInstructions[i], i);
+      OS << "\t\"" << instr->TheDef->getName() << "\",\n";
+    }
+    OS << "];\n\n";
+
 
     if (Tables.hasConflicts()) {
       PrintError(Target.getTargetRecord()->getLoc(), "Primary decode conflict");
@@ -141,16 +148,16 @@ void EmitDisassembler(RecordKeeper &Records, raw_ostream &OS) {
       PredicateNamespace = "ARM";
 
     EmitFixedLenDecoder(Records, OS, PredicateNamespace,
-                        "if (!Check(S, ", "))",
-                        "S", "MCDisassembler::Fail",
-                        "  MCDisassembler::DecodeStatus S = "
-                          "MCDisassembler::Success;\n(void)S;");
+                        "if !Check(&mut S, ", ")",
+                        "S", "DecodeStatus::Fail",
+                        "  DecodeStatus::DecodeStatus S = "
+                          "DecodeStatus::Success;\nS;");
     return;
   }
 
   EmitFixedLenDecoder(Records, OS, Target.getName(),
-                      "if (", " == MCDisassembler::Fail)",
-                      "MCDisassembler::Success", "MCDisassembler::Fail", "");
+                      "if ", " == DecodeStatus::Fail",
+                      "DecodeStatus::Success", "DecodeStatus::Fail", "");
 }
 
 } // End llvm namespace

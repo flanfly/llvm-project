@@ -221,6 +221,9 @@ private:
                       const ModRMFilter &filter,
                       InstrUID uid,
                       uint8_t opcode);
+
+  void emitSemanticsTable(raw_ostream &o, unsigned &i, unsigned args) const;
+
 public:
   /// Constructor - Allocates space for the class decisions and clears them.
   DisassemblerTables();

@@ -33,6 +33,11 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <exception>
+#include <unordered_set>
+#include <unordered_map>
+#include <iostream>
+#include <sstream>
 
 using namespace llvm;
 
@@ -49,10 +54,10 @@ public:
 
   // run - Output the instruction set description.
   void run(raw_ostream &OS);
+  void emitSemantics(raw_ostream &OS);
+  void emitInstructionEnum(raw_ostream &OS);
 
 private:
-  void emitEnums(raw_ostream &OS);
-
   typedef std::map<std::vector<std::string>, unsigned> OperandInfoMapTy;
 
   /// The keys of this map are maps which have OpName enum values as their keys
@@ -73,11 +78,6 @@ private:
   /// Expand TIIPredicate definitions to functions that accept a const MCInst
   /// reference.
   void emitMCIIHelperMethods(raw_ostream &OS, StringRef TargetName);
-  void emitRecord(const CodeGenInstruction &Inst, unsigned Num,
-                  Record *InstrInfo,
-                  std::map<std::vector<Record*>, unsigned> &EL,
-                  const OperandInfoMapTy &OpInfo,
-                  raw_ostream &OS);
   void emitOperandTypesEnum(raw_ostream &OS, const CodeGenTarget &Target);
   void initOperandMapData(
             ArrayRef<const CodeGenInstruction *> NumberedInstructions,
@@ -433,194 +433,709 @@ void PanopticonInstrEmitter::emitTIIHelperMethods(raw_ostream &OS,
 // Main Output.
 //===----------------------------------------------------------------------===//
 
+/// hasNullFragReference - Return true if the DAG has any reference to the
+/// null_frag operator.
+static bool hasNullFragReference(DagInit *DI) {
+  DefInit *OpDef = dyn_cast<DefInit>(DI->getOperator());
+  if (!OpDef) return false;
+  Record *Operator = OpDef->getDef();
+
+  // If this is the null fragment, return true.
+  if (Operator->getName() == "null_frag") return true;
+  // If any of the arguments reference the null fragment, return true.
+  for (unsigned i = 0, e = DI->getNumArgs(); i != e; ++i) {
+    DagInit *Arg = dyn_cast<DagInit>(DI->getArg(i));
+    if (Arg && hasNullFragReference(Arg))
+      return true;
+  }
+
+  return false;
+}
+
+/// hasNullFragReference - Return true if any DAG in the list references
+/// the null_frag operator.
+static bool hasNullFragReference(ListInit *LI) {
+  for (Init *I : LI->getValues()) {
+    DagInit *DI = dyn_cast<DagInit>(I);
+    assert(DI && "non-dag in an instruction Pattern list?!");
+    if (hasNullFragReference(DI))
+      return true;
+  }
+  return false;
+}
+
+struct arg {
+  unsigned bits;
+  unsigned pointed_bits;
+
+  arg() : bits(0), pointed_bits(0) {}
+  arg(unsigned b) : bits(b), pointed_bits(0) {}
+  arg(unsigned b, unsigned p) : bits(b), pointed_bits(p) {}
+  ~arg() {}
+};
+
+std::string nextTemp(unsigned bits, std::unordered_map<std::string, arg> &args, unsigned &next_temp) {
+  std::stringstream ss;
+
+  ss << "t" << next_temp++;
+  args[ss.str()] = bits;
+
+  return ss.str();
+}
+
+std::string processPattern(raw_ostream &OS, DagInit *dag, std::unordered_map<std::string, arg> &args, unsigned &next_temp, bool &fallthru);
+
+std::string processRecord(raw_ostream &OS, Init *rec, std::string const& name, std::unordered_map<std::string, arg> &args, unsigned &next_temp, bool &fallthru) {
+  if (!rec) {
+    llvm_unreachable("processRecord: rec is NULL");
+  }
+
+  auto def = dyn_cast<DefInit>(rec);
+  if (def) {
+    if (name == "") {
+      return def->getAsString();
+    } else {
+      return name;
+    }
+  }
+
+  auto dag = dyn_cast<DagInit>(rec);
+  if (dag) {
+    return processPattern(OS, dag, args, next_temp, fallthru);
+  }
+
+  auto val = dyn_cast<IntInit>(rec);
+  if (val) {
+    std::stringstream ss;
+
+    if (val->getValue() < 0) {
+      ss << "[" << 0xffffffffffffffff - val->getValue() << "]";
+    } else {
+      ss << "[" << val->getValue() << "]";
+    }
+
+    return ss.str();
+  }
+
+  llvm_unreachable("processRecord fell-thru");
+}
+
+std::string processPattern(raw_ostream &OS, DagInit *dag, std::unordered_map<std::string, arg> &args, unsigned &next_temp, bool &fallthru) {
+  auto op = dyn_cast<DefInit>(dag->getOperator());
+  auto opnam = op->getAsString();
+
+  if (opnam == "set") {
+    auto dst = processRecord(OS, dag->getArg(0), dag->getArgNameStr(0).str(), args, next_temp, fallthru);
+    auto src = processRecord(OS, dag->getArg(dag->getNumArgs() - 1), dag->getArgNameStr(dag->getNumArgs() - 1).str(), args, next_temp, fallthru);
+
+    if (dst != "EFLAGS" && args[dst].bits > 0 && args[src].bits > 0) {
+      OS << "\til.extend(rreil!{\n";
+      OS << "\t\tmov " << dst << ":" << args[dst].bits << ", " << src << ":" << args[src].bits << "\n";
+      OS << "\t}?);\n";
+    }
+
+    return dst;
+  } else if (opnam == "store") {
+    auto src = processRecord(OS, dag->getArg(0), dag->getArgNameStr(0).str(), args, next_temp, fallthru);
+    auto addr = processRecord(OS, dag->getArg(1), dag->getArgNameStr(1).str(), args, next_temp, fallthru);
+
+    OS << "\til.extend(rreil!{\n";
+    OS << "\t\tstore/RAM/le/" << args[addr].pointed_bits << " " << addr << ":" << args[addr].bits << ", " << src << ":" << args[src].bits << "\n";
+    OS << "\t}?);\n";
+
+    return src;
+  } else if (opnam == "i8" || opnam == "i16" || opnam == "i32" || opnam == "i64" || opnam == "f64" || opnam == "v2f64" || opnam == "v4f32") {
+    auto t = nextTemp(1, args, next_temp);
+    auto imm = processRecord(OS, dag->getArg(0), dag->getArgNameStr(0).str(), args, next_temp, fallthru);
+
+    OS << "\til.extend(rreil!{\n";
+    OS << "\t\tmov " << t << ":" << args[t].bits << ", " << imm << ":" << args[t].bits << "\n";
+    OS << "\t}?);\n";
+
+    return t;
+  } else if (opnam == "load" || opnam == "loadi8" || opnam == "loadi16" || opnam == "loadi32" || opnam == "loadi64" || opnam == "loadf64" || opnam == "memop" || opnam == "memopv2f64" || opnam == "memopv4f32") {
+    // load addr
+    auto addr = processRecord(OS, dag->getArg(0), dag->getArgNameStr(0).str(), args, next_temp, fallthru);
+    auto t = nextTemp(args[addr].pointed_bits, args, next_temp);
+
+    OS << "\til.extend(rreil!{\n";
+    OS << "\t\tload/RAM/le/" << args[addr].pointed_bits << " " << t << ":" << args[t].bits
+      << ", " << addr << ":" << args[addr].bits << "\n";
+    OS << "\t}?);\n";
+
+    return t;
+  } else if (opnam == "implicit") {
+    return nextTemp(0, args, next_temp);
+  } else if (opnam == "X86call") {
+    return nextTemp(0, args, next_temp);
+  } else if (opnam == "ret") {
+    return nextTemp(0, args, next_temp);
+  } else if (opnam == "reti") {
+    return nextTemp(0, args, next_temp);
+  } else if (opnam == "push") {
+    return nextTemp(0, args, next_temp);
+  } else if (opnam == "pop") {
+    return nextTemp(0, args, next_temp);
+  } else if (opnam == "X86testpat") {
+    return nextTemp(0, args, next_temp);
+  } else if (opnam == "X86cmp") {
+    return nextTemp(0, args, next_temp);
+  } else if (opnam == "X86cmov") {
+    return nextTemp(0, args, next_temp);
+  } else if (opnam == "X86smul_flag") {
+    return nextTemp(0, args, next_temp);
+  } else if (opnam == "X86sub_flag" || opnam == "sub") {
+    return nextTemp(0, args, next_temp);
+  } else if (opnam == "X86sbb_flag") {
+    // X86sbb_flag dst, src, EFLAGS
+    auto dst = processRecord(OS, dag->getArg(0), dag->getArgNameStr(0).str(), args, next_temp, fallthru);
+    auto src = processRecord(OS, dag->getArg(1), dag->getArgNameStr(1).str(), args, next_temp, fallthru);
+    auto b = args[dst].bits;
+    auto res = nextTemp(b, args, next_temp);
+
+    OS << "// X86sbb_flag\n";
+    OS << "\til.extend(rreil!{\n";
+    OS << "\t\tsub " << res << ":" << b << ", " << dst << ", " << src << "\n";
+    OS << "\t\tzext/" << b << " cf:" << b << ", CF:1\n";
+    OS << "\t\tsub " << res << ":" << b << ", " << res << ":" << b << ", cf:" << b << "\n";
+    OS << "\t\tcmplts SF:1, " << res << ":" << b << ", [0]:" << b << "\n";
+    OS << "\t\tcmpeq ZF:1, " << res << ":" << b << ", [0]:" << b << "\n";
+
+    OS << "\t\tmov a:4, " << dst << ":" << b << "\n";
+    OS << "\t\tcmpeq af1:1, " << res << ":4, a:4\n";
+    OS << "\t\tcmpltu af2:1, a:4, " << res << ":4\n";
+    OS << "\t\tand af1:1, af1:1, CF:1\n";
+    OS << "\t\tor AF:1, af1:1, af2:1\n";
+
+    OS << "\t\tmov " << res << ":" << b << ", " << dst << ":" << b << "\n";
+    OS << "\t}?);\n\n";
+
+    OS << "\tset_sub_carry_flag(rreil_var!(" << res << ":" << b << "), rreil_val!(" << dst << ":" << b << "), rreil_val!(" << src << ":" << args[src].bits << "), " << b <<", il)?;\n";
+    OS << "\tset_sub_overflow_flag(rreil_var!(" << res << ":" << b << "), rreil_val!(" << dst << ":" << b << "), rreil_val!(" << src << ":" << args[src].bits << "), " << b <<", il)?;\n";
+    OS << "\tset_parity_flag(rreil_var!(" << res << ":" << b << "), il)?;\n";
+
+    return dst;
+  } else if (opnam == "X86brcond") {
+    auto tgt = processRecord(OS, dag->getArg(0), dag->getArgNameStr(0).str(), args, next_temp, fallthru);
+    auto b = args[tgt].bits;
+    auto cc = dag->getArg(1)->getAsString();
+
+    if (cc == "X86_COND_A") {
+      OS << "\til.extend(rreil!{\n";
+      OS << "\t\tcmpeq ZFnull:1, ZF:1, [0]:1\n";
+      OS << "\t\tcmpeq CFnull:1, CF:1, [0]:1\n";
+      OS << "\t\tand ZFandCFnull:1, CFnull:1, ZFnull:1\n";
+      OS << "\t}?);\n";
+
+      OS << "\tOk(JumpSpec::Branch(rreil_val!(" << tgt << ":" << b
+        << "), Guard::Predicate{ flag: rreil_var!(ZFandCFnull:1), expected: true }))\n}\n\n";
+    } else if (cc == "X86_COND_AE") {
+      OS << "\tOk(JumpSpec::Branch(rreil_val!(" << tgt << ":" << b
+        << "), Guard::Predicate{ flag: rreil_var!(CF:1), expected: false }))\n}\n\n";
+    } else if (cc == "X86_COND_B") {
+      OS << "\tOk(JumpSpec::Branch(rreil_val!(" << tgt << ":" << b
+        << "), Guard::Predicate{ flag: rreil_var!(CF:1), expected: true }))\n}\n\n";
+    } else if (cc == "X86_COND_BE") {
+      OS << "\til.extend(rreil!{\n";
+      OS << "\t\tand ZForCF:1, CF:1, ZF:1\n";
+      OS << "\t}?);\n";
+
+      OS << "\tOk(JumpSpec::Branch(rreil_val!(" << tgt << ":" << b
+        << "), Guard::Predicate{ flag: rreil_var!(CForZF:1), expected: true }))\n}\n\n";
+    } else if (cc == "X86_COND_E") {
+      OS << "\tOk(JumpSpec::Branch(rreil_val!(" << tgt << ":" << b
+        << "), Guard::Predicate{ flag: rreil_var!(ZF:1), expected: true }))\n}\n\n";
+    } else if (cc == "X86_COND_G") {
+      OS << "\til.extend(rreil!{\n";
+      OS << "\t\tcmpeq SFisOF:1, SF:1, OF:1\n";
+      OS << "\t\tcmpeq ZFnull:1, ZF:1, [0]:1\n";
+      OS << "\t\tand ZFandGreater:1, ZFnull:1, SFisOF:1\n";
+      OS << "\t}?);\n";
+
+      OS << "\tOk(JumpSpec::Branch(rreil_val!(" << tgt << ":" << b
+        << "), Guard::Predicate{ flag: rreil_var!(ZFandGreater:1), expected: true }))\n}\n\n";
+    } else if (cc == "X86_COND_GE") {
+      OS << "\til.extend(rreil!{\n";
+      OS << "\t\tcmpeq SFisOF:1, SF:1, OF:1\n";
+      OS << "\t}?);\n";
+
+      OS << "\tOk(JumpSpec::Branch(rreil_val!(" << tgt << ":" << b
+        << "), Guard::Predicate{ flag: rreil_var!(SFisOF:1), expected: true }))\n}\n\n";
+    } else if (cc == "X86_COND_L") {
+      OS << "\til.extend(rreil!{\n";
+      OS << "\t\txor SFxorOF:1, SF:1, OF:1\n";
+      OS << "\t}?);\n";
+
+      OS << "\tOk(JumpSpec::Branch(rreil_val!(" << tgt << ":" << b
+        << "), Guard::Predicate{ flag: rreil_var!(SFxorOF:1), expected: true }))\n}\n\n";
+    } else if (cc == "X86_COND_LE") {
+      OS << "\til.extend(rreil!{\n";
+      OS << "\t\txor SFxorOF:1, SF:1, OF:1\n";
+      OS << "\t\tor ZFofLess:1, ZF:1, SFxorOF:1\n";
+      OS << "\t}?);\n";
+
+      OS << "\tOk(JumpSpec::Branch(rreil_val!(" << tgt << ":" << b
+        << "), Guard::Predicate{ flag: rreil_var!(ZFofLess:1), expected: true }))\n}\n\n";
+    } else if (cc == "X86_COND_NO") {
+      OS << "\tOk(JumpSpec::Branch(rreil_val!(" << tgt << ":" << b
+        << "), Guard::Predicate{ flag: rreil_var!(OF:1), expected: false }))\n}\n\n";
+    } else if (cc == "X86_COND_NE") {
+      OS << "\tOk(JumpSpec::Branch(rreil_val!(" << tgt << ":" << b
+        << "), Guard::Predicate{ flag: rreil_var!(ZF:1), expected: false }))\n}\n\n";
+    } else if (cc == "X86_COND_NP") {
+      OS << "\tOk(JumpSpec::Branch(rreil_val!(" << tgt << ":" << b
+        << "), Guard::Predicate{ flag: rreil_var!(PF:1), expected: false }))\n}\n\n";
+    } else if (cc == "X86_COND_NS") {
+      OS << "\tOk(JumpSpec::Branch(rreil_val!(" << tgt << ":" << b
+        << "), Guard::Predicate{ flag: rreil_var!(SF:1), expected: false }))\n}\n\n";
+    } else if (cc == "X86_COND_O") {
+      OS << "\tOk(JumpSpec::Branch(rreil_val!(" << tgt << ":" << b
+        << "), Guard::Predicate{ flag: rreil_var!(OF:1), expected: true }))\n}\n\n";
+    } else if (cc == "X86_COND_P") {
+      OS << "\tOk(JumpSpec::Branch(rreil_val!(" << tgt << ":" << b
+        << "), Guard::Predicate{ flag: rreil_var!(PF:1), expected: true }))\n}\n\n";
+    } else if (cc == "X86_COND_S") {
+      OS << "\tOk(JumpSpec::Branch(rreil_val!(" << tgt << ":" << b
+        << "), Guard::Predicate{ flag: rreil_var!(SF:1), expected: true }))\n}\n\n";
+    } else {
+      llvm_unreachable("unknown CC");
+    }
+
+    fallthru = false;
+
+    return tgt;
+  } else if (opnam == "brind") {
+    auto tgt = processRecord(OS, dag->getArg(0), dag->getArgNameStr(0).str(), args, next_temp, fallthru);
+    auto b = args[tgt].bits;
+
+    OS << "\tOk(JumpSpec::Jump(rreil_val!(" << tgt << ":" << b << ")))\n}\n\n";
+    fallthru = false;
+
+    return tgt;
+  } else if (opnam == "not") {
+    auto val = processRecord(OS, dag->getArg(0), dag->getArgNameStr(0).str(), args, next_temp, fallthru);
+    auto b = args[val].bits;
+
+    OS << "\til.extend(rreil!{\n";
+    OS << "\t\txor " << val << ":" << b << ", " << val << ":" << b << ", [0xffffffffffffffff]:" << b << "\n";
+    OS << "\t}?);\n\n";
+
+    return val;
+  } else if (opnam == "X86adc_flag" || opnam == "adc") {
+    // X86adc_flag dst, src, EFLAGS
+    auto dst = processRecord(OS, dag->getArg(0), dag->getArgNameStr(0).str(), args, next_temp, fallthru);
+    auto src = processRecord(OS, dag->getArg(1), dag->getArgNameStr(1).str(), args, next_temp, fallthru);
+    auto b = args[dst].bits;
+    auto res = nextTemp(b, args, next_temp);
+
+    OS << "// X86adc_flag\n";
+    OS << "\til.extend(rreil!{\n";
+    OS << "\t\tadd " << res << ":" << b << ", " << dst << ":" << b << ", " << src << ":" << args[src].bits << "\n";
+    OS << "\t\tzext/" << b << " cf:" << b << ", CF:1\n";
+    OS << "\t\tadd " << res << ":" << b << ", " << dst << ":" << b << ", cf:" << b << "\n";
+
+    OS << "\t\tcmplts SF:1, " << res << ":" << b << ", [0]:" << b << "\n";
+
+    OS << "\t\tcmpeq ZF:1, " << res << ":" << b << ", [0]:" << b << "\n\n";
+
+    OS << "\t\tmov a:4, " << src << ":" << args[src].bits << "\n";
+    OS << "\t\tcmpeq af1:1, " << dst << ":4, a:4\n";
+    OS << "\t\tcmpltu af2:1, " << dst << ":4, a:4\n";
+    OS << "\t\tand af1:1, af1:1, CF:1\n";
+    OS << "\t\tor AF:1, af1:1, af2:1\n";
+
+    OS << "\t\tmov " << res << ":" << b << ", " << dst << ":" << b << "\n";
+    OS << "\t}?);\n\n";
+
+    OS << "\tset_carry_flag(rreil_var!(" << res << ":" << b << "), rreil_val!(" << dst << ":" << b << "), rreil_val!(" << src << ":" << args[src].bits << "), " << b <<", il)?;\n";
+    OS << "\tset_overflow_flag(rreil_var!(" << res << ":" << b << "), rreil_val!(" << dst << ":" << b << "), rreil_val!(" << src << ":" << args[src].bits << "), " << b <<", il)?;\n";
+    OS << "\tset_parity_flag(rreil_var!(" << res << ":" << b << "), il)?;\n";
+
+    return dst;
+  } else if (opnam == "fadd" || opnam == "X86Addsub") {
+    assert(dag->getNumArgs() == 2);
+    auto dst = processRecord(OS, dag->getArg(0), dag->getArgNameStr(0).str(), args, next_temp, fallthru);
+    auto src = processRecord(OS, dag->getArg(1), dag->getArgNameStr(1).str(), args, next_temp, fallthru);
+    auto b = args[dst].bits;
+
+    OS << "\til.extend(rreil!{\n";
+    OS << "\t\tmov " << dst << ":" << b << ", ?\n";
+    OS << "\t}?);\n";
+
+    return dst;
+  } else if (opnam == "X86and_flag" || opnam == "and") {
+    // X86and_flag dst, src, EFLAGS
+    auto dst = processRecord(OS, dag->getArg(0), dag->getArgNameStr(0).str(), args, next_temp, fallthru);
+    auto src = processRecord(OS, dag->getArg(1), dag->getArgNameStr(1).str(), args, next_temp, fallthru);
+    auto b = args[dst].bits;
+
+    OS << "\til.extend(rreil!{\n";
+    OS << "\t\tand " << dst << ":" << b << ", " << dst << ":" << b << ", " << src << ":" << b << "\n";
+    OS << "\t\tcmplts SF:1, " << dst << ":" << b << ", [0]:" << b << "\n";
+    OS << "\t\tcmpeq ZF:1, " << dst << ":" << b << ", [0]:" << b << "\n";
+    OS << "\t\tmov CF:1, [0]:1\n";
+    OS << "\t\tmov OF:1, [0]:1\n";
+    OS << "\t\tmov AF:1, ?\n";
+    OS << "\t}?);\n\n";
+
+    OS << "\tset_parity_flag(rreil_var!(" << dst << ":" << b << "), il)?;\n";
+
+    return dst;
+  } else if (opnam == "X86or_flag" || opnam == "or") {
+    // X86or_flag dst, src, EFLAGS
+    auto dst = processRecord(OS, dag->getArg(0), dag->getArgNameStr(0).str(), args, next_temp, fallthru);
+    auto src = processRecord(OS, dag->getArg(1), dag->getArgNameStr(1).str(), args, next_temp, fallthru);
+    auto b = args[dst].bits;
+
+    OS << "\til.extend(rreil!{\n";
+    OS << "\t\tor " << dst << ":" << b << ", " << dst << ":" << b << ", " << src << ":" << b << "\n";
+    OS << "\t\tcmplts SF:1, " << dst << ":" << b << ", [0]:" << b << "\n";
+    OS << "\t\tcmpeq ZF:1, " << dst << ":" << b << ", [0]:" << b << "\n";
+    OS << "\t\tmov CF:1, [0]:1\n";
+    OS << "\t\tmov OF:1, [0]:1\n";
+    OS << "\t\tmov AF:1, ?\n";
+    OS << "\t}?);\n\n";
+
+    OS << "\tset_parity_flag(rreil_var!(" << dst << ":" << b << "), il)?;\n";
+
+    return dst;
+  } else if (opnam == "X86bt") {
+    auto src1 = processRecord(OS, dag->getArg(0), dag->getArgNameStr(0).str(), args, next_temp, fallthru);
+    auto src2 = processRecord(OS, dag->getArg(1), dag->getArgNameStr(1).str(), args, next_temp, fallthru);
+    auto b = args[src1].bits;
+    auto t = nextTemp(b, args, next_temp);
+
+    OS << "\til.extend(rreil!{\n";
+    OS << "\t\tmov " << t << ":" << args[t].bits << ", ?\n";
+    OS << "\t\tmov CF:1, ?\n";
+    OS << "\t}?);\n";
+
+    return t;
+  } else if (opnam == "X86xor_flag" || opnam == "xor") {
+    // X86xor_flag dst, src, EFLAGS
+    auto dst = processRecord(OS, dag->getArg(0), dag->getArgNameStr(0).str(), args, next_temp, fallthru);
+    auto src = processRecord(OS, dag->getArg(1), dag->getArgNameStr(1).str(), args, next_temp, fallthru);
+    auto b = args[dst].bits;
+
+    OS << "\til.extend(rreil!{\n";
+    OS << "\t\txor " << dst << ":" << b << ", " << dst << ":" << b << ", " << src << ":" << b << "\n";
+    OS << "\t\tcmplts SF:1, " << dst << ":" << b << ", [0]:" << b << "\n";
+    OS << "\t\tcmpeq ZF:1, " << dst << ":" << b << ", [0]:" << b << "\n";
+    OS << "\t\tmov CF:1, [0]:1\n";
+    OS << "\t\tmov OF:1, [0]:1\n";
+    OS << "\t\tmov AF:1, ?\n";
+    OS << "\t}?);\n\n";
+
+    OS << "\tset_parity_flag(rreil_var!(" << dst << ":" << b << "), il)?;\n";
+
+    return dst;
+  } else if (opnam == "X86add_flag" || opnam == "add") {
+    // X86add_flag dst, src, EFLAGS
+    auto dst = processRecord(OS, dag->getArg(0), dag->getArgNameStr(0).str(), args, next_temp, fallthru);
+    auto src = processRecord(OS, dag->getArg(1), dag->getArgNameStr(1).str(), args, next_temp, fallthru);
+    auto b = args[dst].bits;
+    auto res = nextTemp(b, args, next_temp);
+
+    OS << "\t// X86add_flag\n";
+    OS << "\til.extend(rreil!{\n";
+    OS << "\t\tadd " << res << ":" << b << ", " << dst << ":" << b << ", " << src << ":" << b << "\n";
+
+    OS << "\t\tcmplts SF:1, " << res << ":" << b << ", [0]:" << b << "\n";
+
+    OS << "\t\tcmpeq ZF:1, " << res << ":" << b << ", [0]:" << b << "\n\n";
+
+    OS << "\t\tmov a:4, " << src << ":" << b << "\n";
+    OS << "\t\tcmpeq af1:1, " << res << ":4, a:4\n";
+    OS << "\t\tcmpltu af2:1, " << res << ":4, a:4\n";
+    OS << "\t\tor AF:1, af1:1, af2:1\n";
+
+    OS << "\t\tmov " << res << ":" << b << ", " << dst << ":" << b << "\n";
+    OS << "\t}?);\n\n";
+
+    OS << "\tset_carry_flag(rreil_var!(" << res << ":" << b << "), rreil_val!(" << dst << ":" << b << "), rreil_val!(" << src << ":" << b << "), " << b <<", il)?;\n";
+    OS << "\tset_overflow_flag(rreil_var!(" << res << ":" << b << "), rreil_val!(" << dst << ":" << b << "), rreil_val!(" << src << ":" << b << "), " << b <<", il)?;\n";
+    OS << "\tset_parity_flag(rreil_var!(" << res << ":" << b << "), il)?;\n";
+
+    return dst;
+  } else {
+    std::vector<std::string> ops;
+
+    for (unsigned i = 0; i < dag->getNumArgs(); i += 1) {
+      ops.push_back(processRecord(OS, dag->getArg(i), dag->getArgNameStr(i).str(), args, next_temp, fallthru));
+    }
+
+    unsigned b = 32;
+
+    if (args.count("dst")) {
+      b = args["dst"].bits;
+    } else if (ops.size() > 0) {
+      b = args[ops[0]].bits;
+    }
+
+    auto t = nextTemp(b, args, next_temp);
+
+    OS << "\t// undefined: " << opnam << "\n";
+    OS << "\til.extend(rreil!{\n";
+    OS << "\t\tmov " << t << ":" << args[t].bits << ", ?\n";
+    OS << "\t}?);\n";
+
+    return t;
+  }
+}
+
 // run - Emit the main instruction description records for the target...
 void PanopticonInstrEmitter::run(raw_ostream &OS) {
+  //emitInstructionEnum(OS);
+  emitSemantics(OS);
+}
+
+void PanopticonInstrEmitter::emitInstructionEnum(raw_ostream &OS) {
+  CodeGenTarget &Target = CDP.getTargetInfo();
+  unsigned Num = 0;
+  OS << "#[derive(PartialEq, Debug, Clone, Copy)]\n";
+  OS << "pub enum Opcode {\n";
+  for (const CodeGenInstruction *Inst : Target.getInstructionsByEnumValue())
+    OS << "    " << Inst->TheDef->getName() << "\t= " << Num++ << ",\n";
+  OS << "}\n\n";
+}
+
+void PanopticonInstrEmitter::emitSemantics(raw_ostream &OS) {
   CodeGenTarget &Target = CDP.getTargetInfo();
   ArrayRef<const CodeGenInstruction*> NumberedInstructions =
     Target.getInstructionsByEnumValue();
   X86Disassembler::DisassemblerTables Tables;
-  ArrayRef<const CodeGenInstruction*> numberedInstructions =
-      Target.getInstructionsByEnumValue();
 
-    for (unsigned i = 0, e = numberedInstructions.size(); i != e; ++i)
-      X86Disassembler::RecognizableInstr::processInstr(Tables, *numberedInstructions[i], i);
+  OS << "#![allow(non_snake_case)]\n\n";
+  OS << "use crate::common::{JumpSpec, set_carry_flag, set_parity_flag, set_overflow_flag};\n";
+  OS << "use crate::decoder::{Instruction, decode_operand};\n";
+  OS << "\n";
+  OS << "use p8n_types::{Value, Statement, Guard, Result};\n";
+  OS << "use p8n_rreil_macro::{rreil_var, rreil_val, rreil};\n";
+  OS << "\n";
 
-    if (Tables.hasConflicts()) {
-      PrintError(Target.getTargetRecord()->getLoc(), "Primary decode conflict");
-      return;
+  for (auto cgi: NumberedInstructions) {
+    auto def = cgi->TheDef;
+
+    if(def->getValueAsBit("isCodeGenOnly") || def->getValueAsBit("isPseudo") || cgi->AsmString == "")
+      continue;
+
+    auto insn = CDP.getInstruction(def);
+    auto src = insn.getSrcPattern();
+    ListInit *LI = nullptr;
+
+    if (isa<ListInit>(def->getValueInit("Pattern")))
+      LI = def->getValueAsListInit("Pattern");
+
+        OS << "// " << cgi->AsmString << "\n";
+    OS << "pub fn sem_"
+      << cgi->TheDef->getName()
+      << "(insn: &mut Instruction, il: &mut Vec<Statement>) -> Result<JumpSpec> {\n";
+
+    std::unordered_map<std::string, arg> args;
+    std::vector<std::string> ops;
+
+    for (unsigned i = 0; i < cgi->Operands.size(); i += 1) { 
+      auto opi = cgi->Operands[i];
+
+      ops.push_back(opi.Name);
+
+      if (opi.Rec->isSubClassOf("RegisterClass") || opi.Rec->isSubClassOf("RegisterOperand")) {
+        std::string cls;
+
+        if (opi.Rec->isSubClassOf("RegisterOperand")) {
+          cls = opi.Rec->getValueAsDef("RegClass")->getName();
+        } else {
+          cls = opi.Rec->getName();
+        }
+
+        // XXX: assumes sizeof(ptr) == 4
+
+        if (cls == "VK1") {
+          args[opi.Name] = 1;
+        } else if (cls == "GR8" || cls == "VK1WM" || cls == "VK2" || cls == "VK4" || cls == "VK8" || cls == "VK2WM" || cls == "VK4WM" || cls == "VK8WM") {
+          args[opi.Name] = 8;
+        } else if (cls == "GR16" || cls == "VK16" || cls == "VK16WM" || cls == "SEGMENT_REG") {
+          args[opi.Name] = 16;
+        } else if (cls == "GR32" || cls == "VK32" || cls == "VK32WM" || cls == "FR32X" || cls == "FR32" || cls == "RFP32" || cls == "CONTROL_REG" || cls == "DEBUG_REG") {
+          args[opi.Name] = 32;
+        } else if (cls == "GR64" || cls == "VK64" || cls == "VK64WM" || cls == "RFP64" || cls == "VR64" || cls == "FR64" || cls == "FR64X") {
+          args[opi.Name] = 64;
+        } else if (cls == "RFP80" || cls == "RST") {
+          args[opi.Name] = 80;
+        } else if (cls == "VR128" || cls == "VR128X" || cls == "BNDR") {
+          args[opi.Name] = 128;
+        } else if (cls == "VR256" || cls == "VR256X") {
+          args[opi.Name] = 256;
+        } else if (cls == "VR512") {
+          args[opi.Name] = 512;
+        } else {
+          OS << "-- RegClass: " << cls << "\n";
+          llvm_unreachable("unknown register class");
+        }
+      } else {
+        auto opty = opi.Rec->getValueAsString("OperandType");
+
+        if (opty == "OPERAND_MEMORY") {
+          auto cls = opi.Rec->getName();
+
+          // XXX: assumes sizeof(ptr) == 4
+
+          if (cls == "i8mem" || cls == "opaquemem" || cls == "anymem" || cls ==  "dstidx8" || cls == "srcidx8" || cls == "offset32_8") {
+            args[opi.Name] = arg(32, 8);
+          } else if (cls == "i16mem" || cls ==  "dstidx16" || cls == "srcidx16" || cls == "offset32_16") {
+            args[opi.Name] = arg(32, 16);
+          } else if (cls == "i32mem" || cls == "f32mem" || cls ==  "dstidx32" || cls == "srcidx32" || cls == "offset32_32") {
+            args[opi.Name] = arg(32, 32);
+          } else if (cls == "i64mem" || cls == "f64mem" || cls == "vx64mem" || cls == "vx64xmem" || cls ==  "dstidx64" || cls == "srcidx64" || cls == "offset32_64") {
+            args[opi.Name] = arg(32, 64);
+          } else if (cls == "f80mem") {
+            args[opi.Name] = arg(32, 80);
+          } else if (cls == "i128mem" || cls == "f128mem" || cls == "sdmem" || cls == "ssmem" || cls == "vx128xmem" || cls == "vx128mem"  || cls == "vy128mem" || cls == "vy128xmem") {
+            args[opi.Name] = arg(32, 128);
+          } else if (cls == "i256mem" || cls == "f256mem" || cls == "vx256mem" || cls == "vx256xmem" || cls == "vy256mem" || cls == "vy256xmem" || cls == "vz256mem") {
+            args[opi.Name] = arg(32, 256);
+          } else if (cls == "i512mem" || cls == "f512mem" || cls == "v512mem" || cls == "vy512xmem" || cls == "vz512mem") {
+            args[opi.Name] = arg(32, 512);
+          } else if (cls == "offset16_8") {
+            args[opi.Name] = arg(16, 8);
+          } else if (cls == "offset16_16") {
+            args[opi.Name] = arg(16, 16);
+          } else if (cls == "offset16_32") {
+            args[opi.Name] = arg(16, 32);
+          } else if (cls == "offset16_64") {
+            args[opi.Name] = arg(16, 64);
+          } else if (cls == "offset64_8") {
+            args[opi.Name] = arg(64, 8);
+          } else if (cls == "offset64_16") {
+            args[opi.Name] = arg(64, 16);
+          } else if (cls == "offset64_32") {
+            args[opi.Name] = arg(64, 32);
+          } else if (cls == "offset64_64") {
+            args[opi.Name] = arg(64, 64);
+           } else {
+             OS << "-- Mem: " << cls << "\n";
+             llvm_unreachable("unknown memory ref");
+          }
+        } else if (opty == "OPERAND_IMMEDIATE") {
+          //OS << "-- Imm\n";
+          auto ty = opi.Rec->getValueAsDef("Type")->getName();
+          auto cls = opi.Rec->getValueAsDef("ParserMatchClass")->getName();
+
+          if (cls == "ImmAsmOperand") {
+            ;
+          } else if (cls == "ImmSExtAsmOperandClass") {
+            ;
+          } else if (cls == "ImmSExti16i8AsmOperand") {
+            ;
+          } else if (cls == "ImmSExti32i8AsmOperand") {
+            ;
+          } else if (cls == "ImmSExti64i8AsmOperand") {
+            ;
+          } else if (cls == "ImmSExti64i32AsmOperand") {
+            ;
+          } else if (cls == "ImmUnsignedi8AsmOperand") {
+            ;
+          } else if (cls == "AVX512RCOperand") {
+            ;
+          } else {
+            llvm_unreachable("unknown imm class");
+          }
+
+          if (ty == "i8") {
+            args[opi.Name] = 8;
+          } else if (ty == "i16") {
+            args[opi.Name] = 16;
+          } else if (ty == "i32") {
+            args[opi.Name] = 32;
+          } else if (ty == "i64") {
+            args[opi.Name] = 64;
+          } else {
+            llvm_unreachable("unknown imm value type");
+          }
+        } else if (opty == "OPERAND_PCREL") {
+          //OS << "-- PC-Rel\n";
+          //OS << *opi.Rec << "\n";
+          args[opi.Name] = 32;
+        } else {
+          //OS << "-- Unk: " << opi.Rec->getValueAsString("OperandType") << "\n";
+          //for (auto p: opi.Rec->getSuperClasses()) {
+          //  OS << "--- " << p.first->getName() << "\n";
+          //}
+          //OS << *opi.Rec << "\n";
+        }
+      }
+
+      assert (opi.Name != "");
     }
 
-    Tables.emit(OS);
-  //  
-  //for (const CodeGenInstruction *Inst : NumberedInstructions) {
-  //  if (Inst->isPseudo || Inst->AsmString == "")
-  //    continue;
 
-  //  // Emit the record into the table.
-  //  //emitRecord(*Inst, InstrInfo, EmittedLists, OperandInfoIDs, OS);
-  //}
-}
+    unsigned idx = 0;
 
-//void PanopticonInstrEmitter::emitRecord(const CodeGenInstruction &Inst,
-//                                  Record *InstrInfo,
-//                                  std::map<std::vector<Record*>, unsigned> &EmittedLists,
-//                                  const OperandInfoMapTy &OpInfo,
-//                                  raw_ostream &OS) {
-//  int MinOperands = 0;
-//  if (!Inst.Operands.empty())
-//    // Each logical operand can be multiple MI operands.
-//    MinOperands = Inst.Operands.back().MIOperandNo +
-//                  Inst.Operands.back().MINumOperands;
-//
-//  OS << "  { ";
-//  OS << Num << ",\t" << MinOperands << ",\t"
-//     << Inst.Operands.NumDefs << ",\t"
-//     << Inst.TheDef->getValueAsInt("Size") << ",\t"
-//     << SchedModels.getSchedClassIdx(Inst) << ",\t0";
-//
-//  CodeGenTarget &Target = CDP.getTargetInfo();
-//
-//  // Emit all of the target independent flags...
-//  if (Inst.isPseudo)           OS << "|(1ULL<<MCID::Pseudo)";
-//  if (Inst.isReturn)           OS << "|(1ULL<<MCID::Return)";
-//  if (Inst.isEHScopeReturn)    OS << "|(1ULL<<MCID::EHScopeReturn)";
-//  if (Inst.isBranch)           OS << "|(1ULL<<MCID::Branch)";
-//  if (Inst.isIndirectBranch)   OS << "|(1ULL<<MCID::IndirectBranch)";
-//  if (Inst.isCompare)          OS << "|(1ULL<<MCID::Compare)";
-//  if (Inst.isMoveImm)          OS << "|(1ULL<<MCID::MoveImm)";
-//  if (Inst.isMoveReg)          OS << "|(1ULL<<MCID::MoveReg)";
-//  if (Inst.isBitcast)          OS << "|(1ULL<<MCID::Bitcast)";
-//  if (Inst.isAdd)              OS << "|(1ULL<<MCID::Add)";
-//  if (Inst.isTrap)             OS << "|(1ULL<<MCID::Trap)";
-//  if (Inst.isSelect)           OS << "|(1ULL<<MCID::Select)";
-//  if (Inst.isBarrier)          OS << "|(1ULL<<MCID::Barrier)";
-//  if (Inst.hasDelaySlot)       OS << "|(1ULL<<MCID::DelaySlot)";
-//  if (Inst.isCall)             OS << "|(1ULL<<MCID::Call)";
-//  if (Inst.canFoldAsLoad)      OS << "|(1ULL<<MCID::FoldableAsLoad)";
-//  if (Inst.mayLoad)            OS << "|(1ULL<<MCID::MayLoad)";
-//  if (Inst.mayStore)           OS << "|(1ULL<<MCID::MayStore)";
-//  if (Inst.isPredicable)       OS << "|(1ULL<<MCID::Predicable)";
-//  if (Inst.isConvertibleToThreeAddress) OS << "|(1ULL<<MCID::ConvertibleTo3Addr)";
-//  if (Inst.isCommutable)       OS << "|(1ULL<<MCID::Commutable)";
-//  if (Inst.isTerminator)       OS << "|(1ULL<<MCID::Terminator)";
-//  if (Inst.isReMaterializable) OS << "|(1ULL<<MCID::Rematerializable)";
-//  if (Inst.isNotDuplicable)    OS << "|(1ULL<<MCID::NotDuplicable)";
-//  if (Inst.Operands.hasOptionalDef) OS << "|(1ULL<<MCID::HasOptionalDef)";
-//  if (Inst.usesCustomInserter) OS << "|(1ULL<<MCID::UsesCustomInserter)";
-//  if (Inst.hasPostISelHook)    OS << "|(1ULL<<MCID::HasPostISelHook)";
-//  if (Inst.Operands.isVariadic)OS << "|(1ULL<<MCID::Variadic)";
-//  if (Inst.hasSideEffects)     OS << "|(1ULL<<MCID::UnmodeledSideEffects)";
-//  if (Inst.isAsCheapAsAMove)   OS << "|(1ULL<<MCID::CheapAsAMove)";
-//  if (!Target.getAllowRegisterRenaming() || Inst.hasExtraSrcRegAllocReq)
-//    OS << "|(1ULL<<MCID::ExtraSrcRegAllocReq)";
-//  if (!Target.getAllowRegisterRenaming() || Inst.hasExtraDefRegAllocReq)
-//    OS << "|(1ULL<<MCID::ExtraDefRegAllocReq)";
-//  if (Inst.isRegSequence) OS << "|(1ULL<<MCID::RegSequence)";
-//  if (Inst.isExtractSubreg) OS << "|(1ULL<<MCID::ExtractSubreg)";
-//  if (Inst.isInsertSubreg) OS << "|(1ULL<<MCID::InsertSubreg)";
-//  if (Inst.isConvergent) OS << "|(1ULL<<MCID::Convergent)";
-//  if (Inst.variadicOpsAreDefs) OS << "|(1ULL<<MCID::VariadicOpsAreDefs)";
-//
-//  // Emit all of the target-specific flags...
-//  BitsInit *TSF = Inst.TheDef->getValueAsBitsInit("TSFlags");
-//  if (!TSF)
-//    PrintFatalError(Inst.TheDef->getLoc(), "no TSFlags?");
-//  uint64_t Value = 0;
-//  for (unsigned i = 0, e = TSF->getNumBits(); i != e; ++i) {
-//    if (const auto *Bit = dyn_cast<BitInit>(TSF->getBit(i)))
-//      Value |= uint64_t(Bit->getValue()) << i;
-//    else
-//      PrintFatalError(Inst.TheDef->getLoc(),
-//                      "Invalid TSFlags bit in " + Inst.TheDef->getName());
-//  }
-//  OS << ", 0x";
-//  OS.write_hex(Value);
-//  OS << "ULL, ";
-//
-//  // Emit the implicit uses and defs lists...
-//  std::vector<Record*> UseList = Inst.TheDef->getValueAsListOfDefs("Uses");
-//  if (UseList.empty())
-//    OS << "nullptr, ";
-//  else
-//    OS << "ImplicitList" << EmittedLists[UseList] << ", ";
-//
-//  std::vector<Record*> DefList = Inst.TheDef->getValueAsListOfDefs("Defs");
-//  if (DefList.empty())
-//    OS << "nullptr, ";
-//  else
-//    OS << "ImplicitList" << EmittedLists[DefList] << ", ";
-//
-//  // Emit the operand info.
-//  std::vector<std::string> OperandInfo = GetOperandInfo(Inst);
-//  if (OperandInfo.empty())
-//    OS << "nullptr";
-//  else
-//    OS << "OperandInfo" << OpInfo.find(OperandInfo)->second;
-//
-//  if (Inst.HasComplexDeprecationPredicate)
-//    // Emit a function pointer to the complex predicate method.
-//    OS << ", -1 "
-//       << ",&get" << Inst.DeprecatedReason << "DeprecationInfo";
-//  else if (!Inst.DeprecatedReason.empty())
-//    // Emit the Subtarget feature.
-//    OS << ", " << Target.getInstNamespace() << "::" << Inst.DeprecatedReason
-//       << " ,nullptr";
-//  else
-//    // Instruction isn't deprecated.
-//    OS << ", -1 ,nullptr";
-//
-//  OS << " },  // Inst #" << Num << " = " << Inst.TheDef->getName() << "\n";
-//}
+    OS << "\til.extend(rreil!{\n";
+    for (auto o: ops) {
+      unsigned bits = args[o].bits;
+      
+      if (bits == 0 && cgi->TheDef->getName() == "LEA64r") {
+        bits = 64;
+      } else if (bits == 0 && (cgi->TheDef->getName() == "LEA64_32r" || cgi->TheDef->getName() == "LEA32r")) {
+        bits = 32;
+      }
 
-// emitEnums - Print out enum values for all of the instructions.
-void PanopticonInstrEmitter::emitEnums(raw_ostream &OS) {
-  OS << "#ifdef GET_INSTRINFO_ENUM\n";
-  OS << "#undef GET_INSTRINFO_ENUM\n";
+      OS << "\t\tmov " << o << ":" << bits << ", (decode_operand(insn, insn.operands.unwrap()[" << idx << "].clone(), " << bits << ")?.1)\n";
+      idx += 1;
+    }
+    OS << "\t}?);\n";
 
-  OS << "namespace llvm {\n\n";
+    bool fallthru = true;
+    unsigned next_tmp = 0;
 
-  CodeGenTarget Target(Records);
+    if (!LI || LI->empty() || hasNullFragReference(LI)) {
+      if (cgi->TheDef->getName().substr(0, 6) == "PUSH16") {
+        OS << "\t// XXX: push word\n";
+      } else if (cgi->TheDef->getName().substr(0, 6) == "PUSH32") {
+        OS << "\t// XXX: push dword\n";
+      } else if (cgi->TheDef->getName().substr(0, 6) == "PUSH64") {
+        OS << "\t// XXX: push qword\n";
+      } else if (cgi->TheDef->getName().substr(0, 3) == "LEA") {
+        OS << "\t// XXX: lea\n";
+      } else if (cgi->TheDef->getName().substr(0, 4) == "CALL") {
+        OS << "\t// XXX: call\n";
+      } else if (cgi->TheDef->getName().substr(0, 7) == "FARCALL") {
+        OS << "\t// XXX: farcall\n";
+      } else if (cgi->TheDef->getName().substr(0, 3) == "RET") {
+        OS << "\t// XXX: ret\n";
+      } else {
+        OS << "\t// no sematics defined\n";
+      }
+    } else {
+      for (auto initdag: *LI) {
+        auto dag = dyn_cast<DagInit>(initdag);
+        processPattern(OS, dag, args, next_tmp, fallthru);
+      }
+    }
 
-  // We must emit the PHI opcode first...
-  StringRef Namespace = Target.getInstNamespace();
+    if (fallthru) {
+      OS << "\tOk(JumpSpec::FallThru)\n}\n\n";
+    }
+  }
 
-  if (Namespace.empty())
-    PrintFatalError("No instructions defined!");
+  OS << "pub const SEMANTICS: &'static [Option<fn(&mut Instruction, &mut Vec<Statement>) -> Result<JumpSpec>>] = &[\n";
+  for (auto cgi: NumberedInstructions) {
+    auto def = cgi->TheDef;
 
-  OS << "namespace " << Namespace << " {\n";
-  OS << "  enum {\n";
-  unsigned Num = 0;
-  for (const CodeGenInstruction *Inst : Target.getInstructionsByEnumValue())
-    OS << "    " << Inst->TheDef->getName() << "\t= " << Num++ << ",\n";
-  OS << "    INSTRUCTION_LIST_END = " << Num << "\n";
-  OS << "  };\n\n";
-  OS << "} // end " << Namespace << " namespace\n";
-  OS << "} // end llvm namespace\n";
-  OS << "#endif // GET_INSTRINFO_ENUM\n\n";
-
-  OS << "#ifdef GET_INSTRINFO_SCHED_ENUM\n";
-  OS << "#undef GET_INSTRINFO_SCHED_ENUM\n";
-  OS << "namespace llvm {\n\n";
-  OS << "namespace " << Namespace << " {\n";
-  OS << "namespace Sched {\n";
-  OS << "  enum {\n";
-  Num = 0;
-  for (const auto &Class : SchedModels.explicit_classes())
-    OS << "    " << Class.Name << "\t= " << Num++ << ",\n";
-  OS << "    SCHED_LIST_END = " << Num << "\n";
-  OS << "  };\n";
-  OS << "} // end Sched namespace\n";
-  OS << "} // end " << Namespace << " namespace\n";
-  OS << "} // end llvm namespace\n";
-
-  OS << "#endif // GET_INSTRINFO_SCHED_ENUM\n\n";
+    if(def->getValueAsBit("isCodeGenOnly") || def->getValueAsBit("isPseudo") || cgi->AsmString == "") {
+      OS << "\tNone, // " << def->getName() << "\n";
+    } else {
+      OS << "\tSome(sem_" << def->getName() << "),\n";
+    }
+  }
+  OS << "];\n";
 }
 
 namespace llvm {
 
 void EmitPanopticonInstrs(RecordKeeper &RK, raw_ostream &OS) {
   PanopticonInstrEmitter(RK).run(OS);
-  //EmitMapTable(RK, OS);
 }
 
 } // end llvm namespace

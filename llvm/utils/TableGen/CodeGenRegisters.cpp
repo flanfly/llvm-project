@@ -66,11 +66,7 @@ CodeGenSubRegIndex::CodeGenSubRegIndex(StringRef N, StringRef Nspace,
 }
 
 std::string CodeGenSubRegIndex::getQualifiedName() const {
-  std::string N = getNamespace();
-  if (!N.empty())
-    N += "::";
-  N += getName();
-  return N;
+  return "Register::" + getName();
 }
 
 void CodeGenSubRegIndex::updateComponents(CodeGenRegBank &RegBank) {
@@ -920,10 +916,7 @@ static bool TopoOrderRC(const CodeGenRegisterClass &PA,
 }
 
 std::string CodeGenRegisterClass::getQualifiedName() const {
-  if (Namespace.empty())
-    return getName();
-  else
-    return (Namespace + "::" + getName()).str();
+  return "Register::" + getName();
 }
 
 // Compute sub-classes of all register classes.

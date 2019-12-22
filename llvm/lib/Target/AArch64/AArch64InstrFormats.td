@@ -274,13 +274,13 @@ class AsmImmRange<int Low, int High> : AsmOperandClass {
 def SImm10s8Operand : SImmScaledMemoryIndexed<10, 8>;
 def simm10Scaled : Operand<i64> {
   let ParserMatchClass = SImm10s8Operand;
-  let DecoderMethod = "DecodeSImm<10>";
+  let DecoderMethod = "DecodeSImm::<_10>";
   let PrintMethod = "printImmScale<8>";
 }
 
 def simm9s16 : Operand<i64> {
   let ParserMatchClass = SImmScaledMemoryIndexed<9, 16>;
-  let DecoderMethod = "DecodeSImm<9>";
+  let DecoderMethod = "DecodeSImm::<_9>";
   let PrintMethod = "printImmScale<16>";
 }
 
@@ -301,30 +301,30 @@ def uimm16 : Operand<i16>, ImmLeaf<i16, [{return Imm >= 0 && Imm < 65536;}]>{
 def SImm9Operand : SImmOperand<9>;
 def simm9 : Operand<i64>, ImmLeaf<i64, [{ return Imm >= -256 && Imm < 256; }]> {
   let ParserMatchClass = SImm9Operand;
-  let DecoderMethod = "DecodeSImm<9>";
+  let DecoderMethod = "DecodeSImm::<_9>";
 }
 
 def SImm8Operand : SImmOperand<8>;
 def simm8 : Operand<i64>, ImmLeaf<i64, [{ return Imm >= -128 && Imm < 127; }]> {
   let ParserMatchClass = SImm8Operand;
-  let DecoderMethod = "DecodeSImm<8>";
+  let DecoderMethod = "DecodeSImm::<_8>";
 }
 
 def SImm6Operand : SImmOperand<6>;
 def simm6_32b : Operand<i32>, ImmLeaf<i32, [{ return Imm >= -32 && Imm < 32; }]> {
   let ParserMatchClass = SImm6Operand;
-  let DecoderMethod = "DecodeSImm<6>";
+  let DecoderMethod = "DecodeSImm::<_6>";
 }
 
 def SImm5Operand : SImmOperand<5>;
 def simm5_64b : Operand<i64>, ImmLeaf<i64, [{ return Imm >= -16 && Imm < 16; }]> {
   let ParserMatchClass = SImm5Operand;
-  let DecoderMethod = "DecodeSImm<5>";
+  let DecoderMethod = "DecodeSImm::<_5>";
 }
 
 def simm5_32b : Operand<i32>, ImmLeaf<i32, [{ return Imm >= -16 && Imm < 16; }]> {
   let ParserMatchClass = SImm5Operand;
-  let DecoderMethod = "DecodeSImm<5>";
+  let DecoderMethod = "DecodeSImm::<_5>";
 }
 
 // simm7sN predicate - True if the immediate is a multiple of N in the range
@@ -414,7 +414,7 @@ def uimm6s16 : Operand<i64>, ImmLeaf<i64,
 def SImm6s1Operand : SImmScaledMemoryIndexed<6, 1>;
 def simm6s1 : Operand<i64>, ImmLeaf<i64, [{ return Imm >= -32 && Imm < 32; }]> {
   let ParserMatchClass = SImm6s1Operand;
-  let DecoderMethod = "DecodeSImm<6>";
+  let DecoderMethod = "DecodeSImm::<_6>";
 }
 
 // simm4sN predicate - True if the immediate is a multiple of N in the range
@@ -428,34 +428,34 @@ def SImm4s16Operand : SImmScaledMemoryIndexed<4, 16>;
 def simm4s1 : Operand<i64>, ImmLeaf<i64,
 [{ return Imm >=-8  && Imm <= 7; }]> {
   let ParserMatchClass = SImm4s1Operand;
-  let DecoderMethod = "DecodeSImm<4>";
+  let DecoderMethod = "DecodeSImm::<_4>";
 }
 
 def simm4s2 : Operand<i64>, ImmLeaf<i64,
 [{ return Imm >=-16  && Imm <= 14 && (Imm % 2) == 0x0; }]> {
   let PrintMethod = "printImmScale<2>";
   let ParserMatchClass = SImm4s2Operand;
-  let DecoderMethod = "DecodeSImm<4>";
+  let DecoderMethod = "DecodeSImm::<_4>";
 }
 
 def simm4s3 : Operand<i64>, ImmLeaf<i64,
 [{ return Imm >=-24  && Imm <= 21 && (Imm % 3) == 0x0; }]> {
   let PrintMethod = "printImmScale<3>";
   let ParserMatchClass = SImm4s3Operand;
-  let DecoderMethod = "DecodeSImm<4>";
+  let DecoderMethod = "DecodeSImm::<_4>";
 }
 
 def simm4s4 : Operand<i64>, ImmLeaf<i64,
 [{ return Imm >=-32  && Imm <= 28 && (Imm % 4) == 0x0; }]> {
   let PrintMethod = "printImmScale<4>";
   let ParserMatchClass = SImm4s4Operand;
-  let DecoderMethod = "DecodeSImm<4>";
+  let DecoderMethod = "DecodeSImm::<_4>";
 }
 def simm4s16 : Operand<i64>, ImmLeaf<i64,
 [{ return Imm >=-128  && Imm <= 112 && (Imm % 16) == 0x0; }]> {
   let PrintMethod = "printImmScale<16>";
   let ParserMatchClass = SImm4s16Operand;
-  let DecoderMethod = "DecodeSImm<4>";
+  let DecoderMethod = "DecodeSImm::<_4>";
 }
 
 def Imm1_8Operand : AsmImmRange<1, 8>;

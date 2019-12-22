@@ -170,7 +170,7 @@ class imm8_opt_lsl<int ElementWidth, string printType,
                    AsmOperandClass OpndClass, code Predicate>
     : Operand<i32>, ImmLeaf<i32, Predicate> {
   let EncoderMethod = "getImm8OptLsl";
-  let DecoderMethod = "DecodeImm8OptLsl<" # ElementWidth # ">";
+  let DecoderMethod = "DecodeImm8OptLsl::<_" # ElementWidth # ">";
   let PrintMethod = "printImm8OptLsl<" # printType # ">";
   let ParserMatchClass = OpndClass;
   let MIOperandInfo = (ops i32imm, i32imm);
