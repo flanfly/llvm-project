@@ -579,12 +579,52 @@ std::string processPattern(raw_ostream &OS, DagInit *dag, std::unordered_map<std
   } else if (opnam == "X86testpat") {
     return nextTemp(0, args, next_temp);
   } else if (opnam == "X86cmp") {
+auto dst = processRecord(OS, dag->getArg(0), dag->getArgNameStr(0).str(), args, next_temp, fallthru);
+    auto src = processRecord(OS, dag->getArg(1), dag->getArgNameStr(1).str(), args, next_temp, fallthru);
+    auto b = args[dst].bits;
+    auto res = nextTemp(b, args, next_temp);
+
+    OS << "// X86cmp_flag\n";
+    OS << "\til.extend(rreil!{\n";
+    OS << "\tsub res:" << b << ", " << dst << ":" << b ", " << src << ":" << b "\n";
+    OS << "\tcmplts SF:1, res:" << b << ", [0]:" << b << "\n";
+    OS << "\tcmpeq ZF:1, res:" << b << ", [0]:" << b << "\n";
+
+    OS << "\t\tmov " << res << ":" << b << ", " << dst << ":" << b << "\n";
+    OS << "\t}?);\n\n";
+
+    OS << "\tset_sub_carry_flag(rreil_var!(" << res << ":" << b << "), rreil_val!(" << dst << ":" << b << "), rreil_val!(" << src << ":" << args[src].bits << "), " << b <<", il)?;\n";
+    OS << "\tset_sub_adj_flag(rreil_var!(" << res << ":" << b << "), rreil_val!(" << dst << ":" << b << "), rreil_val!(" << src << ":" << args[src].bits << "), " << b <<", il)?;\n";
+    OS << "\tset_sub_overflow_flag(rreil_var!(" << res << ":" << b << "), rreil_val!(" << dst << ":" << b << "), rreil_val!(" << src << ":" << args[src].bits << "), " << b <<", il)?;\n";
+    OS << "\tset_parity_flag(rreil_var!(" << res << ":" << b << "), il)?;\n";
+
+
     return nextTemp(0, args, next_temp);
   } else if (opnam == "X86cmov") {
     return nextTemp(0, args, next_temp);
   } else if (opnam == "X86smul_flag") {
     return nextTemp(0, args, next_temp);
   } else if (opnam == "X86sub_flag" || opnam == "sub") {
+auto dst = processRecord(OS, dag->getArg(0), dag->getArgNameStr(0).str(), args, next_temp, fallthru);
+    auto src = processRecord(OS, dag->getArg(1), dag->getArgNameStr(1).str(), args, next_temp, fallthru);
+    auto b = args[dst].bits;
+    auto res = nextTemp(b, args, next_temp);
+
+    OS << "// X86sub_flag\n";
+    OS << "\til.extend(rreil!{\n";
+    OS << "\t\tsub res:" << b << ", " << dst << ":" << b ", " << src << ":" << b "\n";
+    OS << "\t\tcmplts SF:1, res:" << b << ", [0]:" << b << "\n";
+    OS << "\t\tcmpeq ZF:1, res:" << b << ", [0]:" << b << "\n";
+
+    OS << "\t\tmov " << res << ":" << b << ", " << dst << ":" << b << "\n";
+    OS << "\t}?);\n\n";
+
+    OS << "\tset_sub_carry_flag(rreil_var!(" << res << ":" << b << "), rreil_val!(" << dst << ":" << b << "), rreil_val!(" << src << ":" << args[src].bits << "), " << b <<", il)?;\n";
+    OS << "\tset_sub_adj_flag(rreil_var!(" << res << ":" << b << "), rreil_val!(" << dst << ":" << b << "), rreil_val!(" << src << ":" << args[src].bits << "), " << b <<", il)?;\n";
+    OS << "\tset_sub_overflow_flag(rreil_var!(" << res << ":" << b << "), rreil_val!(" << dst << ":" << b << "), rreil_val!(" << src << ":" << args[src].bits << "), " << b <<", il)?;\n";
+    OS << "\tset_parity_flag(rreil_var!(" << res << ":" << b << "), il)?;\n";
+
+
     return nextTemp(0, args, next_temp);
   } else if (opnam == "X86sbb_flag") {
     // X86sbb_flag dst, src, EFLAGS
